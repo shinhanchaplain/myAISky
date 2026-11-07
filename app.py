@@ -16,10 +16,12 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
+from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -60,7 +62,7 @@ class WeatherAPIError(RuntimeError):
 
 
 class WeatherObservation(BaseModel):
-    source: str                      # "KMA" 또는 "demo"
+    source: str                      # "KMA", "demo" 또는 "cache"
     observed_at: str
     temperature_c: float | None
     humidity_pct: float | None
@@ -69,6 +71,33 @@ class WeatherObservation(BaseModel):
     precipitation_type: int | None
     status: str
     note: str | None = None
+    cache_age_minutes: int | None = None  # source="cache"일 때 관측 후 경과 시간(분)
+
+
+# 마지막으로 성공한 실제 KMA 관측 (메모리 캐시). 데모/캐시 데이터는 넣지 않는다.
+_last_kma_obs: WeatherObservation | None = None
+CACHE_MAX_AGE = timedelta(hours=3)
+
+
+def _cache_fallback(now: datetime | None = None) -> WeatherObservation | None:
+    """상류 실패 시 사용할 캐시 관측을 반환. 없거나 3시간 초과면 None."""
+    obs = _last_kma_obs
+    if obs is None:
+        return None
+    now = now or datetime.now(KST)
+    try:
+        observed = datetime.strptime(obs.observed_at, "%Y-%m-%d %H:%M").replace(tzinfo=KST)
+    except ValueError:
+        return None
+    age = now - observed
+    if age > CACHE_MAX_AGE:
+        return None
+    minutes = max(int(age.total_seconds() // 60), 0)
+    return obs.model_copy(update={
+        "source": "cache",
+        "cache_age_minutes": minutes,
+        "note": f"기상청 호출 실패로 캐시 사용 (관측 {obs.observed_at}, {minutes}분 경과)",
+    })
 
 
 def init_db() -> None:
@@ -132,7 +161,8 @@ def _fetch_sky_label(service_key: str, now: datetime) -> str | None:
         nearest = min(sky, key=lambda i: i["fcstTime"])
         return SKY_LABELS.get(int(nearest["fcstValue"]))
     except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
-        logger.warning("하늘상태 조회 실패(강수 상태만 사용): %s", exc)
+        # 예외 문자열에 serviceKey 포함 URL이 들어갈 수 있어 예외 종류만 기록
+        logger.warning("하늘상태 조회 실패(강수 상태만 사용): %s", type(exc).__name__)
         return None
 
 
@@ -170,16 +200,35 @@ def fetch_kma_current(now: datetime | None = None) -> WeatherObservation:
         resp = requests.get(KMA_URL, params=params, timeout=10)
         resp.raise_for_status()
         payload = resp.json()
-    except (requests.RequestException, ValueError) as exc:
-        raise WeatherAPIError(f"기상청 API 호출 실패: {exc}") from exc
+    except requests.HTTPError as exc:
+        # 예외 문자열에는 serviceKey가 담긴 URL이 들어 있으므로 상태 코드만 사용
+        status = exc.response.status_code if exc.response is not None else None
+        if status in (401, 403):
+            logger.error("기상청 API 인증 거부(HTTP %s): 인증키 미등록/만료/활용신청 승인 여부를 확인하세요.", status)
+            raise WeatherAPIError(f"기상청 API 인증 거부(HTTP {status})") from None
+        logger.error("기상청 API HTTP 오류: %s", status)
+        raise WeatherAPIError(f"기상청 API HTTP 오류({status})") from None
+    except requests.Timeout:
+        logger.error("기상청 API 타임아웃")
+        raise WeatherAPIError("기상청 API 타임아웃") from None
+    except requests.RequestException as exc:
+        logger.error("기상청 API 연결 실패: %s", type(exc).__name__)
+        raise WeatherAPIError(f"기상청 API 연결 실패({type(exc).__name__})") from None
+    except ValueError:
+        # 200 이지만 JSON이 아닌 경우 (XML 에러 응답 등)
+        logger.error("기상청 API 응답이 JSON이 아님 (XML 에러 응답 가능: 인증키 오류 등)")
+        raise WeatherAPIError("기상청 API 응답 해석 실패(JSON 아님)") from None
 
     response = payload.get("response", {})
     header = response.get("header", {})
     if header.get("resultCode") != "00":
         raise WeatherAPIError(f"기상청 API 오류: {header.get('resultMsg', 'unknown')}")
 
-    items = response.get("body", {}).get("items", {}).get("item", [])
-    values = {item["category"]: item["obsrValue"] for item in items}
+    try:
+        items = response.get("body", {}).get("items", {}).get("item", [])
+        values = {item["category"]: item["obsrValue"] for item in items}
+    except (AttributeError, KeyError, TypeError) as exc:
+        raise WeatherAPIError(f"기상청 API 응답 구조 오류({type(exc).__name__})") from None
 
     pty = int(_to_float(values.get("PTY")) or 0)
     # 강수가 있으면 강수 형태, 없으면 하늘상태(맑음/구름많음/흐림)를 날씨 상태로 사용
@@ -410,13 +459,14 @@ function render(d) {
   $("h-cond").textContent = d.status;
   $("h-icon").textContent = ICONS[d.status] || "🌡️";
   $("h-where").innerHTML = "";
-  ["서울 · " + (d.source === "demo" ? "데모 데이터" : "기상청 실시간"), "관측 " + d.observed_at]
+  const srcLabel = d.source === "demo" ? "데모 데이터" : d.source === "cache" ? `캐시 (${d.cache_age_minutes}분 전 관측)` : "기상청 실시간";
+  ["서울 · " + srcLabel, "관측 " + d.observed_at]
     .forEach((t) => { const r = document.createElement("div"); r.textContent = t; $("h-where").appendChild(r); });
   $("s-temp").textContent = fmt(d.temperature_c, "°C");
   $("s-hum").textContent = fmt(d.humidity_pct, "%");
   $("s-wind").textContent = fmt(d.wind_speed_ms, " m/s");
   $("s-status").textContent = d.status;
-  $("meta").textContent = `${d.source === "demo" ? "[DEMO] " : ""}관측 ${d.observed_at} · ${d.note || ""}`;
+  $("meta").textContent = `${d.source === "demo" ? "[DEMO] " : d.source === "cache" ? "[캐시] " : ""}관측 ${d.observed_at} · ${d.note || ""}`;
   if (d.temperature_c !== null) {
     samples.push({ label: timeLabel(), temp: d.temperature_c });
     if (samples.length > MAX_POINTS) samples.shift();
@@ -461,8 +511,77 @@ setInterval(syncWeather, AUTO_SYNC_MS);
 </html>
 """
 
+def fetch_and_record() -> WeatherObservation:
+    """기상청 조회 후 실제 KMA 관측이면 캐시 갱신 및 DB 적재. 상류 실패 시 WeatherAPIError를 그대로 전파."""
+    global _last_kma_obs
+    obs = fetch_kma_current()
+    # 데모 데이터는 캐시/DB를 오염시키지 않도록 실제 기상청 데이터만 반영
+    if obs.source == "KMA" and obs.temperature_c is not None:
+        _last_kma_obs = obs
+        try:
+            if save_weather_log(obs):
+                logger.info("weather_logs 저장: %s %s°C %s", obs.observed_at, obs.temperature_c, obs.status)
+        except sqlite3.Error as exc:
+            logger.error("DB 저장 실패: %s", exc)
+    return obs
+
+
+SCHEDULER_INTERVAL_MIN = 10
+_scheduler: BackgroundScheduler | None = None
+
+
+def scheduled_weather_job() -> None:
+    """10분 주기 백그라운드 잡. 예외는 로그만 남기고 스케줄러가 죽지 않게 한다."""
+    try:
+        obs = fetch_and_record()
+        logger.info("스케줄러 수집 완료: source=%s", obs.source)
+    except WeatherAPIError as exc:
+        logger.error("스케줄러 수집 실패 (캐시 유지): %s", exc)
+    except Exception:  # noqa: BLE001 - 어떤 오류든 스케줄러를 멈추지 않는다
+        logger.exception("스케줄러 잡 예기치 않은 오류")
+
+
+def start_scheduler() -> BackgroundScheduler:
+    """스케줄러 시작 (이미 실행 중이면 재기동하지 않음). 시작 직후 1회 즉시 실행해 캐시를 시드한다."""
+    global _scheduler
+    if _scheduler is not None and _scheduler.running:
+        return _scheduler
+    sched = BackgroundScheduler(timezone=KST)
+    sched.add_job(
+        scheduled_weather_job,
+        "interval",
+        minutes=SCHEDULER_INTERVAL_MIN,
+        id="weather_collect",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=120,
+        next_run_time=datetime.now(KST),  # 시작 즉시 1회 실행 (스케줄러 스레드에서 수행)
+    )
+    sched.start()
+    _scheduler = sched
+    logger.info("백그라운드 스케줄러 시작 (%s분 주기)", SCHEDULER_INTERVAL_MIN)
+    return sched
+
+
+def stop_scheduler() -> None:
+    global _scheduler
+    if _scheduler is not None and _scheduler.running:
+        _scheduler.shutdown(wait=False)
+        logger.info("백그라운드 스케줄러 종료")
+    _scheduler = None
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    start_scheduler()
+    try:
+        yield
+    finally:
+        stop_scheduler()
+
+
 init_db()
-app = FastAPI(title="myAISky", version="0.1.0")
+app = FastAPI(title="myAISky", version="0.1.0", lifespan=lifespan)
 app.mount("/images", StaticFiles(directory=IMAGE_DIR), name="images")
 
 
@@ -474,17 +593,14 @@ def dashboard() -> str:
 @app.get("/api/weather", response_model=WeatherObservation)
 def get_weather() -> WeatherObservation:
     try:
-        obs = fetch_kma_current()
+        obs = fetch_and_record()
     except WeatherAPIError as exc:
         logger.error("%s", exc)
+        cached = _cache_fallback()
+        if cached is not None:
+            logger.warning("캐시 폴백 반환 (%s분 경과), DB에는 저장하지 않음", cached.cache_age_minutes)
+            return cached  # 캐시는 DB에 재적재하지 않는다
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    # 데모 데이터는 DB를 오염시키지 않도록 실제 기상청 데이터만 적재
-    if obs.source == "KMA" and obs.temperature_c is not None:
-        try:
-            if save_weather_log(obs):
-                logger.info("weather_logs 저장: %s %s°C %s", obs.observed_at, obs.temperature_c, obs.status)
-        except sqlite3.Error as exc:
-            logger.error("DB 저장 실패: %s", exc)
     return obs
 
 
