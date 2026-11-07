@@ -7,13 +7,15 @@
 환경 변수
 - KMA_SERVICE_KEY : 공공데이터포털 기상청 API 인증키 (Decoding 키 권장).
                     미설정 시 데모 데이터를 반환합니다.
-- KMA_NX, KMA_NY  : 기상청 격자 좌표 (기본 60, 127 = 서울 부근)
+- KMA_NX, KMA_NY  : 기상청 격자 좌표 (기본 55, 127 = 서울)
+- 실측 데이터는 weather_logs.db 의 weather_logs 테이블에 자동 저장됩니다.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -30,9 +32,16 @@ BASE_DIR = Path(__file__).resolve().parent
 IMAGE_DIR = BASE_DIR / "images"
 KST = timezone(timedelta(hours=9))
 
-KMA_URL = "http://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getUltraSrtNcst"
-KMA_NX = int(os.getenv("KMA_NX", "60"))
+KMA_BASE_URL = "https://apis.data.go.kr/1360000/VilageFcstInfoService_2.0"
+KMA_URL = f"{KMA_BASE_URL}/getUltraSrtNcst"      # 초단기실황
+KMA_FCST_URL = f"{KMA_BASE_URL}/getUltraSrtFcst"  # 초단기예보 (하늘상태 SKY 용)
+KMA_NX = int(os.getenv("KMA_NX", "55"))
 KMA_NY = int(os.getenv("KMA_NY", "127"))
+
+DB_PATH = BASE_DIR / "weather_logs.db"
+
+# 초단기예보 하늘상태(SKY) 코드
+SKY_LABELS = {1: "맑음", 3: "구름많음", 4: "흐림"}
 
 # 초단기실황 강수형태(PTY) 코드
 PTY_LABELS = {
@@ -62,6 +71,31 @@ class WeatherObservation(BaseModel):
     note: str | None = None
 
 
+def init_db() -> None:
+    """weather_logs 테이블 생성. 같은 관측 시각(timestamp)은 한 번만 저장한다."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS weather_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                temperature REAL,
+                condition TEXT NOT NULL,
+                timestamp TEXT NOT NULL UNIQUE
+            )
+            """
+        )
+
+
+def save_weather_log(obs: WeatherObservation) -> bool:
+    """실제 기상청 관측값을 DB에 INSERT. 저장되면 True, 중복이면 False."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO weather_logs (temperature, condition, timestamp) VALUES (?, ?, ?)",
+            (obs.temperature_c, obs.status, obs.observed_at),
+        )
+        return cur.rowcount > 0
+
+
 def _to_float(value: object) -> float | None:
     """기상청 응답의 '-', '강수없음' 등 비수치 값을 None으로 변환."""
     try:
@@ -74,6 +108,32 @@ def _kma_base_datetime(now: datetime) -> tuple[str, str]:
     """초단기실황은 매시 40분 이후에 해당 시각 자료가 제공되므로 그 전에는 직전 정시를 사용."""
     base = now - timedelta(hours=1) if now.minute < 40 else now
     return base.strftime("%Y%m%d"), base.strftime("%H00")
+
+
+def _fetch_sky_label(service_key: str, now: datetime) -> str | None:
+    """초단기예보에서 가장 가까운 시각의 하늘상태(맑음/구름많음/흐림)를 조회. 실패 시 None."""
+    # 초단기예보는 매시 30분 발표, 45분 이후 제공
+    base = now - timedelta(hours=1) if now.minute < 45 else now
+    params = {
+        "serviceKey": service_key,
+        "pageNo": 1,
+        "numOfRows": 60,
+        "dataType": "JSON",
+        "base_date": base.strftime("%Y%m%d"),
+        "base_time": base.strftime("%H30"),
+        "nx": KMA_NX,
+        "ny": KMA_NY,
+    }
+    try:
+        resp = requests.get(KMA_FCST_URL, params=params, timeout=10)
+        resp.raise_for_status()
+        items = resp.json()["response"]["body"]["items"]["item"]
+        sky = [i for i in items if i["category"] == "SKY"]
+        nearest = min(sky, key=lambda i: i["fcstTime"])
+        return SKY_LABELS.get(int(nearest["fcstValue"]))
+    except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+        logger.warning("하늘상태 조회 실패(강수 상태만 사용): %s", exc)
+        return None
 
 
 def fetch_kma_current(now: datetime | None = None) -> WeatherObservation:
@@ -122,6 +182,10 @@ def fetch_kma_current(now: datetime | None = None) -> WeatherObservation:
     values = {item["category"]: item["obsrValue"] for item in items}
 
     pty = int(_to_float(values.get("PTY")) or 0)
+    # 강수가 있으면 강수 형태, 없으면 하늘상태(맑음/구름많음/흐림)를 날씨 상태로 사용
+    status = PTY_LABELS.get(pty, "알 수 없음")
+    if pty == 0:
+        status = _fetch_sky_label(service_key, now) or status
     return WeatherObservation(
         source="KMA",
         observed_at=f"{base_date[:4]}-{base_date[4:6]}-{base_date[6:]} {base_time[:2]}:{base_time[2:]}",
@@ -130,7 +194,7 @@ def fetch_kma_current(now: datetime | None = None) -> WeatherObservation:
         wind_speed_ms=_to_float(values.get("WSD")),
         precipitation_mm=_to_float(values.get("RN1")),
         precipitation_type=pty,
-        status=PTY_LABELS.get(pty, "알 수 없음"),
+        status=status,
         note="기상청 초단기실황",
     )
 
@@ -179,6 +243,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     background: #E7F5EA; color: #21673A; border: 1px solid #BFE3CB;
     padding: 8px 14px; border-radius: 999px; font-size: 14px; font-weight: 600; white-space: nowrap;
   }
+  .hero {
+    display: flex; align-items: center; justify-content: space-between; gap: 20px; flex-wrap: wrap;
+    background: linear-gradient(135deg, #4A8FD6 0%, #7DB8EA 55%, #BFDDF5 100%);
+    color: #fff; border-radius: 20px; padding: 24px 32px; margin-bottom: 20px;
+    box-shadow: 0 10px 30px rgba(74, 143, 214, 0.35);
+  }
+  .hero .icon { font-size: 84px; line-height: 1; filter: drop-shadow(0 4px 8px rgba(0,0,0,0.2)); }
+  .hero .temp { font-size: 76px; font-weight: 800; letter-spacing: -2px; line-height: 1; }
+  .hero .cond { font-size: 22px; font-weight: 600; margin-top: 6px; }
+  .hero .where { font-size: 14px; opacity: 0.9; text-align: right; line-height: 1.7; }
+  .hero .left { display: flex; align-items: center; gap: 22px; }
   .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 20px; }
   .stat { background: #fff; border-radius: 16px; padding: 16px 18px; border: 1px solid var(--line); }
   .stat .label { font-size: 13px; color: var(--muted); }
@@ -232,6 +307,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
       <span class="badge">🟢 24/7 Sandbox Active</span>
     </header>
+
+    <section class="hero">
+      <div class="left">
+        <div class="icon" id="h-icon">⛅</div>
+        <div>
+          <div class="temp" id="h-temp">--</div>
+          <div class="cond" id="h-cond">불러오는 중...</div>
+        </div>
+      </div>
+      <div class="where" id="h-where">서울 · 기상청 실시간</div>
+    </section>
 
     <section class="stats">
       <div class="stat"><div class="label">현재 기온</div><div class="value" id="s-temp">--</div></div>
@@ -316,7 +402,16 @@ function drawTrend() {
   });
 }
 
+const ICONS = { "맑음": "☀️", "구름많음": "⛅", "흐림": "☁️", "비": "🌧️", "빗방울": "🌦️",
+                "비/눈": "🌨️", "빗방울/눈날림": "🌨️", "눈": "❄️", "눈날림": "❄️", "강수 없음": "🌤️" };
+
 function render(d) {
+  $("h-temp").textContent = d.temperature_c === null ? "--" : `${d.temperature_c}°`;
+  $("h-cond").textContent = d.status;
+  $("h-icon").textContent = ICONS[d.status] || "🌡️";
+  $("h-where").innerHTML = "";
+  ["서울 · " + (d.source === "demo" ? "데모 데이터" : "기상청 실시간"), "관측 " + d.observed_at]
+    .forEach((t) => { const r = document.createElement("div"); r.textContent = t; $("h-where").appendChild(r); });
   $("s-temp").textContent = fmt(d.temperature_c, "°C");
   $("s-hum").textContent = fmt(d.humidity_pct, "%");
   $("s-wind").textContent = fmt(d.wind_speed_ms, " m/s");
@@ -366,6 +461,7 @@ setInterval(syncWeather, AUTO_SYNC_MS);
 </html>
 """
 
+init_db()
 app = FastAPI(title="myAISky", version="0.1.0")
 app.mount("/images", StaticFiles(directory=IMAGE_DIR), name="images")
 
@@ -378,10 +474,18 @@ def dashboard() -> str:
 @app.get("/api/weather", response_model=WeatherObservation)
 def get_weather() -> WeatherObservation:
     try:
-        return fetch_kma_current()
+        obs = fetch_kma_current()
     except WeatherAPIError as exc:
         logger.error("%s", exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    # 데모 데이터는 DB를 오염시키지 않도록 실제 기상청 데이터만 적재
+    if obs.source == "KMA" and obs.temperature_c is not None:
+        try:
+            if save_weather_log(obs):
+                logger.info("weather_logs 저장: %s %s°C %s", obs.observed_at, obs.temperature_c, obs.status)
+        except sqlite3.Error as exc:
+            logger.error("DB 저장 실패: %s", exc)
+    return obs
 
 
 if __name__ == "__main__":
